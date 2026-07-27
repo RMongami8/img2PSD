@@ -17,3 +17,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .claude/
+
+!docs/pipeline_overview.png
