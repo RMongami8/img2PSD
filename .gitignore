@@ -19,3 +19,13 @@ Thumbs.db
 .claude/
 
 !docs/pipeline_overview.png
+
+# evaluation fixtures: ground-truth matte and real generated inputs
+!benchmark/*.png
+!test_data/*.png
+
+# downloaded super-resolution weights
+models/
+
+# scratch output from tools/eval_matte.py
+out_testdata/

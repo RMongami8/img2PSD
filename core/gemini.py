@@ -14,6 +14,36 @@ GENERATE_CONTENT_URL = (
 )
 
 
+KEY_PRESETS = {
+    "green": ((0, 255, 0), "純緑 (#00FF00)"),
+    "magenta": ((255, 0, 255), "純マゼンタ (#FF00FF)"),
+    "blue": ((0, 0, 255), "純青 (#0000FF)"),
+}
+
+
+def key_bg_instruction(preset: str) -> str:
+    name = KEY_PRESETS.get(preset, KEY_PRESETS["green"])[1]
+    return (
+        f"\n\n背景は必ず完全に均一な{name}の単色で塗りつぶすこと。"
+        "背景にグラデーション・影・模様・テクスチャを一切入れない。"
+        f"キャラクター本体には{name}系の色を一切使わないこと。"
+        f"{name}の照り返しや反射光もキャラクターに乗せない。"
+        "キャラクターの輪郭・ポーズ・構図は入力画像から変更しないこと。"
+    )
+
+
+def compose_prompt(prompt: str, key_preset: str = None) -> str:
+    """Append the key-background instruction to the user's prompt.
+
+    Folding this into the existing colourisation call rather than issuing a second
+    request is what keeps the mask aligned: the matte is derived from the very image
+    it will be applied to, so there is no registration error to correct.
+    """
+    if not key_preset:
+        return prompt
+    return prompt + key_bg_instruction(key_preset)
+
+
 def _rgb_to_png_b64(rgb: np.ndarray) -> str:
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     ok, buf = cv2.imencode(".png", bgr)

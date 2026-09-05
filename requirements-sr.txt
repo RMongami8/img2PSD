@@ -1,0 +1,3 @@
+# Optional: CPU super-resolution for the background-removal mask.
+# Without this the mask still builds, using Lanczos supersampling instead.
+onnxruntime>=1.20

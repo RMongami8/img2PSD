@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "width": 2048,
+  "height": 2048,
+  "key_rgb": [
+    0,
+    255,
+    0
+  ],
+  "white_rgb": [
+    255,
+    255,
+    255
+  ],
+  "compositing_space": "sRGB numeric (non-linear)",
+  "formula": "C = alpha * F + (1 - alpha) * K",
+  "alpha_encoding": "8-bit grayscale, 0=background, 255=foreground",
+  "alpha_normalization": "source alpha remapped linearly: <=32 to 0, >=223 to 255",
+  "fractional_alpha_pixels": 206035,
+  "files": {
+    "foreground_rgba": "anime_hair_foreground_rgba_2048.png",
+    "alpha_ground_truth": "anime_hair_alpha_gt_2048.png",
+    "white_reference": "anime_hair_white_srgb_2048.png",
+    "green_input": "anime_hair_green_srgb_2048.png"
+  }
+}
