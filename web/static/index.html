@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lineart2psd</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:ital,wght@0,400;0,500;0,600;0,700;0,800;0,900;1,400;1,600&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; }
+  body {
+    background:#e9e8e4; color:#14151a; font-family:'Archivo',sans-serif;
+    min-height:100vh; overflow-x:hidden; position:relative;
+  }
+  a { color:inherit; text-decoration:none; cursor:pointer; }
+  a:hover { opacity:.55; }
+  [hidden] { display:none !important; }
+
+  .grain-svg { position:fixed; inset:0; width:100%; height:100%; pointer-events:none; z-index:0; }
+  .ghost-num {
+    position:fixed; top:14vh; right:-8vw; font-weight:900; font-size:38vw; line-height:1;
+    color:rgba(20,21,26,.045); pointer-events:none; z-index:0; user-select:none;
+  }
+  .vlabel {
+    position:fixed; top:130px; right:30px; bottom:130px; writing-mode:vertical-rl;
+    letter-spacing:3px; color:rgba(20,21,26,.34); font-size:11.5px; font-weight:500; z-index:0;
+  }
+
+  .app { position:relative; z-index:1; min-height:100vh; max-width:1440px; margin:0 auto; padding:0 64px; }
+
+  header.top { display:flex; align-items:flex-start; justify-content:space-between; padding-top:30px; }
+  .nav { display:flex; align-items:center; gap:22px; margin-top:2px; }
+  .meta { font-weight:500; font-size:11.5px; letter-spacing:.4px; color:rgba(20,21,26,.62); }
+
+  .mark-plus { display:block; }
+
+  .id-block { margin-top:26px; }
+  .id-handle { margin-top:8px; }
+
+  .datecell { font-weight:700; font-size:19px; letter-spacing:5px; line-height:1.5; }
+
+  .headline-block { text-align:right; }
+  .headline { font-weight:700; font-size:25px; letter-spacing:-.2px; }
+  .headline-meta { margin-top:8px; }
+
+  .rule { margin-top:24px; height:1px; background:rgba(20,21,26,.16); border:none; }
+
+  main { position:relative; padding-top:64px; min-height:560px; }
+
+  .tag { text-align:right; font-weight:700; font-size:15px; margin-bottom:34px; }
+
+  .word-just { font-style:italic; font-weight:400; font-size:22px; margin-bottom:4px; }
+  .word-line1 { font-weight:800; font-size:50px; line-height:1.08; letter-spacing:-.5px; }
+  .box {
+    margin-top:12px; display:inline-block; background:#14151a; color:#f2f1ed;
+    font-weight:900; font-size:112px; line-height:1; padding:14px 30px;
+  }
+  .definition { margin-top:56px; font-weight:700; font-size:25px; line-height:1.32; max-width:560px; }
+
+  .adv-toggle { display:inline-block; margin-top:28px; font-weight:600; font-size:13px; border-bottom:1px solid rgba(20,21,26,.3); padding-bottom:2px; }
+  .adv-panel {
+    margin-top:26px; max-width:620px; border-top:1px solid rgba(20,21,26,.16); padding-top:22px;
+    display:flex; flex-direction:column; gap:18px;
+  }
+  .adv-field label { display:block; font-weight:600; font-size:11.5px; letter-spacing:.5px; color:rgba(20,21,26,.6); text-transform:uppercase; margin-bottom:6px; }
+  .adv-field textarea, .adv-field select {
+    width:100%; font-family:'Archivo',sans-serif; font-weight:500; font-size:14px; color:#14151a;
+    border:none; border-bottom:1.5px solid #14151a; background:transparent; padding:8px 0; resize:vertical;
+  }
+  .adv-check { display:flex; align-items:center; gap:10px; font-weight:500; font-size:13.5px; }
+  .adv-check input { width:15px; height:15px; accent-color:#14151a; }
+
+  .dropzone-hint { position:relative; }
+
+  footer.bottom { margin-top:64px; padding-bottom:76px; }
+  .cta { font-weight:700; font-size:27px; letter-spacing:-.2px; }
+  .corner-mark { position:fixed; right:64px; bottom:76px; z-index:1; }
+
+  /* drag overlay */
+  .drag-overlay {
+    position:fixed; inset:24px; z-index:50; border:2px dashed #14151a; background:rgba(233,232,228,.92);
+    display:flex; align-items:center; justify-content:center; font-weight:800; font-size:34px;
+  }
+
+  /* progress screen */
+  .steprow { display:flex; align-items:center; justify-content:space-between; padding:20px 0; border-bottom:1px solid rgba(20,21,26,.14); }
+  .steprow.current { border-bottom:none; padding:0; margin:6px 0; }
+  .stepidx { font-weight:900; font-size:16px; width:34px; }
+  .steplabel { font-weight:700; font-size:22px; }
+  .step-done .steplabel, .step-done .stepidx { color:rgba(20,21,26,.4); }
+  .step-pending .steplabel, .step-pending .stepidx { color:rgba(20,21,26,.32); }
+  .step-current { display:inline-flex; align-items:center; gap:22px; background:#14151a; color:#f2f1ed; padding:16px 26px; }
+  .step-current .stepidx { color:#f2f1ed; }
+
+  /* results screen */
+  .results-grid { display:flex; gap:120px; }
+  .filerow { display:flex; align-items:center; justify-content:space-between; padding:16px 0; border-bottom:1px solid rgba(20,21,26,.14); width:476px; }
+  .filename { font-weight:700; font-size:19px; }
+  .filespec { font-weight:400; font-size:13px; color:rgba(20,21,26,.5); margin-top:2px; }
+  .dl { font-weight:700; font-size:13px; letter-spacing:.3px; }
+  .fringe-row { display:flex; align-items:center; gap:16px; margin-top:16px; }
+  .fringe-label { font-weight:600; font-size:12px; width:64px; letter-spacing:.3px; }
+  .fringe-row input[type=range] { flex:1; accent-color:#14151a; }
+  .preview-tabs { display:flex; gap:24px; margin-bottom:14px; align-items:center; justify-content:space-between; }
+  .preview-tab-group { display:flex; gap:24px; }
+  .preview-tab { font-weight:600; font-size:13px; letter-spacing:.3px; color:rgba(20,21,26,.45); border-bottom:1.5px solid transparent; padding-bottom:4px; }
+  .preview-tab.active { color:#14151a; border-bottom-color:#14151a; }
+  .preview-tab.disabled { color:rgba(20,21,26,.2); pointer-events:none; }
+
+  .bg-swatches { display:flex; gap:7px; }
+  .bg-swatch { width:17px; height:17px; border:1px solid rgba(20,21,26,.28); cursor:pointer; }
+  .bg-swatch.active { border-color:#14151a; outline:1.5px solid #14151a; outline-offset:2px; }
+  .bg-swatch[data-bg="checker"] { background:repeating-conic-gradient(#ffffff 0% 25%, #dcdad4 0% 50%) 0 0/8px 8px; }
+  .bg-swatch[data-bg="white"] { background:#ffffff; }
+  .bg-swatch[data-bg="gray"] { background:#3a3a3c; }
+  .bg-swatch[data-bg="black"] { background:#000000; }
+
+  .cutout-preview {
+    position:relative; width:476px; height:330px;
+    display:flex; align-items:center; justify-content:center; border:1px solid rgba(20,21,26,.16);
+    overflow:hidden; cursor:zoom-in; touch-action:none;
+  }
+  .cutout-preview.bg-checker { background:repeating-conic-gradient(#ffffff 0% 25%, #dcdad4 0% 50%) 0 0/16px 16px; }
+  .cutout-preview.bg-white { background:#ffffff; }
+  .cutout-preview.bg-gray { background:#3a3a3c; }
+  .cutout-preview.bg-black { background:#000000; }
+  .preview-zoomwrap { width:100%; height:100%; display:flex; align-items:center; justify-content:center; }
+  .cutout-preview img { max-width:100%; max-height:100%; pointer-events:none; user-select:none; }
+  .cutout-preview.panning { cursor:grabbing; }
+  .cutout-preview.zoomed { cursor:grab; }
+  .tile-overlay {
+    position:absolute; inset:0; z-index:5; pointer-events:none;
+    display:grid; grid-template-columns:repeat(10,1fr); grid-template-rows:repeat(7,1fr);
+  }
+  .tile-overlay .tile { background:#14151a; transform:scale(1); opacity:1; transition:transform .32s ease, opacity .32s ease; }
+  .tile-overlay .tile.hide { transform:scale(0); opacity:0; }
+  .zoom-indicator { position:absolute; right:10px; bottom:10px; font-size:11px; font-weight:600; letter-spacing:.3px; color:rgba(20,21,26,.5); background:rgba(242,241,237,.85); padding:3px 8px; z-index:6; }
+  .error-banner { color:#8a2020; font-weight:700; font-size:15px; margin-top:20px; }
+
+  /* api key modal */
+  .scrim { position:fixed; inset:0; background:rgba(20,21,26,.62); z-index:100; }
+  .modal-card { position:absolute; top:220px; left:50%; transform:translateX(-50%); width:640px; background:#f2f1ed; border:1.5px solid #14151a; }
+  .modal-inner { padding:64px 48px 48px 48px; }
+  .modal-eyebrow { font-style:italic; font-weight:400; font-size:18px; margin-bottom:6px; }
+  .modal-title { font-weight:800; font-size:26px; letter-spacing:-.3px; line-height:1.3; margin-bottom:36px; }
+  .field-label { font-weight:600; font-size:11.5px; letter-spacing:1px; color:rgba(20,21,26,.55); text-transform:uppercase; margin-bottom:8px; }
+  .field-input { font-weight:500; font-size:18px; color:#14151a; border:none; border-bottom:1.5px solid #14151a; background:transparent; padding:10px 0; width:100%; font-family:'Archivo',sans-serif; }
+  .modal-note { margin-top:16px; line-height:1.6; }
+  .modal-cta { display:flex; justify-content:flex-end; margin-top:40px; }
+  .modal-cta span { font-weight:700; font-size:18px; cursor:pointer; }
+  .modal-close { position:absolute; top:24px; right:26px; cursor:pointer; }
+
+  @media (max-width: 900px) {
+    .app { padding:0 24px; }
+    .word-line1 { font-size:34px; }
+    .box { font-size:64px; padding:10px 18px; }
+    .vlabel, .ghost-num { display:none; }
+    .corner-mark { right:24px; }
+    .results-grid { flex-direction:column; gap:32px; }
+    .filerow, .cutout-preview { width:100%; }
+    .headline-block { text-align:left; }
+    header.top { flex-direction:column; gap:16px; }
+  }
+</style>
+</head>
+<body>
+
+<svg class="grain-svg" xmlns="http://www.w3.org/2000/svg">
+  <filter id="grain">
+    <feTurbulence type="fractalNoise" baseFrequency="0.82" numOctaves="2" stitchTiles="stitch"/>
+    <feColorMatrix type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.05 0"/>
+  </filter>
+  <rect width="100%" height="100%" filter="url(#grain)"/>
+</svg>
+<div class="ghost-num">2</div>
+<div class="vlabel">GEMINI · PYMATTING · PSD EXPORT</div>
+
+<div class="app">
+  <header class="top">
+    <div class="id-block">
+      <svg class="mark-plus" width="17" height="17" viewBox="0 0 17 17"><path d="M8.5 1v15M1 8.5h15" stroke="#14151a" stroke-width="2"/></svg>
+      <div class="meta id-handle">@lineart2psd</div>
+    </div>
+    <div class="date-stack">
+      <div class="datecell" id="date-y"></div>
+      <div class="datecell" id="date-md"></div>
+      <div class="datecell" id="date-hm"></div>
+    </div>
+    <div style="text-align:right;">
+      <div class="nav">
+        <a href="/gradio" id="classic-link">classic ui</a>
+        <a href="#" id="settings-link">settings</a>
+      </div>
+      <div class="headline-block" style="margin-top:22px;">
+        <div class="headline" id="headline">AI colorize &amp; cutout studio</div>
+        <div class="meta headline-meta" id="headline-meta">png · svg · psd</div>
+      </div>
+    </div>
+  </header>
+
+  <hr class="rule">
+
+  <main>
+    <!-- drop screen -->
+    <section id="screen-drop">
+      <div class="tag">step 00</div>
+      <div class="word-just">just</div>
+      <div class="word-line1">IMG 2 LINE 2 RBG</div>
+      <div class="box">ART</div>
+      <div class="definition">to turn ink linework into a<br>colored, layered PSD.</div>
+
+      <a class="adv-toggle" id="adv-toggle">詳細設定 ▾</a>
+      <div class="adv-panel" id="adv-panel" hidden>
+        <div class="adv-field">
+          <label>プロンプト</label>
+          <textarea id="prompt-input" rows="4"></textarea>
+        </div>
+        <div class="adv-check"><input type="checkbox" id="opt-bg-remove" checked><label for="opt-bg-remove">背景透過を有効にする</label></div>
+        <div class="adv-field">
+          <label>キー色</label>
+          <select id="opt-key-color">
+            <option value="green">green</option>
+            <option value="magenta">magenta</option>
+            <option value="blue">blue</option>
+          </select>
+        </div>
+        <div class="adv-field">
+          <label>境界の処理</label>
+          <select id="opt-edge-method">
+            <option value="matting" selected>matting（α再推定＋前景色推定・推奨）</option>
+            <option value="foreground">foreground（前景色推定のみ）</option>
+            <option value="analytic">analytic（旧・解析的）</option>
+          </select>
+        </div>
+        <div class="adv-check"><input type="checkbox" id="opt-band-authority" checked><label for="opt-band-authority">髪の隙間をきれいにする（推奨）</label></div>
+        <div class="adv-check"><input type="checkbox" id="opt-crop-on" checked><label for="opt-crop-on">PSDを元画像の比率でクロップする</label></div>
+        <div class="adv-check"><input type="checkbox" id="opt-lineart-ref"><label for="opt-lineart-ref">線画も参照画像として送る</label></div>
+      </div>
+    </section>
+
+    <!-- progress screen -->
+    <section id="screen-progress" hidden>
+      <div class="word-just">working on it</div>
+      <div id="step-list" style="margin-top:44px; width:820px; max-width:100%;"></div>
+      <div class="meta" id="progress-meta" style="margin-top:18px;"></div>
+      <div class="error-banner" id="error-banner" hidden></div>
+      <div id="error-actions" style="margin-top:16px; display:flex; gap:24px;" hidden>
+        <a class="meta" id="error-retry" style="font-weight:700;">↻ もう一度試す</a>
+        <a class="meta" id="error-back">← 最初に戻る</a>
+      </div>
+    </section>
+
+    <!-- results screen -->
+    <section id="screen-results" hidden>
+      <div class="word-just">all done</div>
+      <div class="box" style="margin-bottom:56px;">READY</div>
+      <div class="results-grid">
+        <div>
+          <div class="preview-tabs" id="preview-tabs">
+            <div class="preview-tab-group">
+              <a class="preview-tab" data-key="before">変更前</a>
+              <a class="preview-tab" data-key="lineart">線画</a>
+              <a class="preview-tab active" data-key="cutout">透過画像</a>
+            </div>
+            <div class="bg-swatches" id="bg-swatches">
+              <a class="bg-swatch active" data-bg="checker" title="チェッカー"></a>
+              <a class="bg-swatch" data-bg="white" title="白"></a>
+              <a class="bg-swatch" data-bg="gray" title="ダークグレー"></a>
+              <a class="bg-swatch" data-bg="black" title="黒"></a>
+            </div>
+          </div>
+          <div class="cutout-preview bg-checker" id="preview-stage">
+            <div class="preview-zoomwrap" id="preview-zoomwrap"><img id="cutout-img" alt="preview"></div>
+            <div class="tile-overlay" id="tile-overlay"></div>
+            <div class="zoom-indicator" id="zoom-indicator" hidden>100%</div>
+          </div>
+          <div class="fringe-row" style="margin-top:14px;">
+            <div class="fringe-label">zoom</div>
+            <input type="range" id="zoom-range" min="100" max="600" step="5" value="100">
+            <a class="meta" id="zoom-reset" style="white-space:nowrap; font-weight:700; min-width:52px; text-align:right;">100%</a>
+          </div>
+
+          <div style="margin-top:26px;">
+            <div class="meta" style="margin-bottom:8px;">フリンジ微調整</div>
+            <div class="fringe-row"><div class="fringe-label">choke</div><input type="range" id="fr-choke" min="-3" max="3" step="0.1" value="0"></div>
+            <div class="fringe-row"><div class="fringe-label">feather</div><input type="range" id="fr-feather" min="0" max="5" step="0.1" value="0"></div>
+            <div class="fringe-row"><div class="fringe-label">gamma</div><input type="range" id="fr-gamma" min="0.2" max="3" step="0.05" value="1"></div>
+          </div>
+        </div>
+        <div id="file-list"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="bottom">
+    <div class="meta" id="footer-hint">drag &amp; drop · paste · browse</div>
+    <a class="cta" id="footer-cta">drop an image to begin</a>
+  </footer>
+  <svg class="corner-mark" width="17" height="17" viewBox="0 0 17 17"><path d="M8.5 1v15M1 8.5h15" stroke="#14151a" stroke-width="2"/></svg>
+</div>
+
+<!-- api key modal -->
+<div class="scrim" id="modal-scrim" hidden>
+  <div class="modal-card">
+    <svg class="modal-close" width="14" height="14" viewBox="0 0 14 14"><path d="M1 1l12 12M13 1L1 13" stroke="#14151a" stroke-width="1.8"/></svg>
+    <div class="modal-inner">
+      <div class="modal-eyebrow">before you begin</div>
+      <div class="modal-title">gemini apiキーを入力してください</div>
+      <div class="field-label">gemini api key</div>
+      <input class="field-input" type="password" id="apikey-input" placeholder="AIzaSy...">
+      <div class="meta modal-note">このブラウザにのみ保存されます · Gemini APIの呼び出し以外に送信されることはありません</div>
+      <div class="modal-cta"><span id="apikey-continue">続ける →</span></div>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="file-input" accept="image/*" hidden>
+<div class="drag-overlay" id="drag-overlay" hidden>ドロップして開始</div>
+
+<script>
+(() => {
+  const STEP_LABELS = {
+    preprocess: "① 前処理・線画抽出", generate: "② AI彩色", keygen: "④-a キー背景生成",
+    mask: "④-b 背景マスク生成", fringe: "⑤ フリンジ調整", psd: "③ PSD書き出し",
+  };
+  const STEP_ORDER = ["preprocess", "generate", "keygen", "mask", "fringe", "psd"];
+  const DEFAULT_PROMPT = "画像のキャラクターを忠実に維持して、線画を消して、色塗だけの画像を出力してください。" +
+    "つまり黒い線を消して、色だけのキャラクターを出力してください。線画なし、輪郭線なし、境界線なし、" +
+    "参照カラー画像のカラーパレットを厳密に維持、元の陰影スタイルを維持、細部を再解釈しない、再設計しない、" +
+    "参照カラー画像の絶対的な忠実さで出力し、線画削除以外のいかなる細部も再解釈、再設計、再スタイル化しないでください。";
+
+  const $ = (id) => document.getElementById(id);
+  const promptInput = $("prompt-input");
+  promptInput.value = DEFAULT_PROMPT;
+
+  let sessionId = null;
+  let currentFile = null;
+  let pendingAfterKey = null;
+  let results = {}; // step name -> {..._url fields}
+
+  // ---- date/time ----
+  function tick() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    $("date-y").textContent = String(d.getFullYear()).split("").join(" ");
+    $("date-md").textContent = pad(d.getMonth() + 1) + " . " + pad(d.getDate());
+    $("date-hm").textContent = pad(d.getHours()) + " : " + pad(d.getMinutes());
+  }
+  tick();
+  setInterval(tick, 30000);
+
+  // ---- api key (localStorage) ----
+  function getApiKey() { try { return localStorage.getItem("gemini_api_key") || ""; } catch (e) { return ""; } }
+  function setApiKey(k) { try { localStorage.setItem("gemini_api_key", k); } catch (e) {} }
+
+  function showModal() {
+    $("apikey-input").value = getApiKey();
+    $("modal-scrim").hidden = false;
+  }
+  function hideModal() { $("modal-scrim").hidden = true; }
+
+  $("settings-link").addEventListener("click", (e) => { e.preventDefault(); showModal(); });
+  document.querySelector(".modal-close").addEventListener("click", hideModal);
+  $("apikey-continue").addEventListener("click", () => {
+    const v = $("apikey-input").value.trim();
+    if (!v) return;
+    setApiKey(v);
+    hideModal();
+    if (pendingAfterKey) { const f = pendingAfterKey; pendingAfterKey = null; startRun(f); }
+  });
+
+  if (!getApiKey()) showModal();
+
+  // ---- advanced settings ----
+  $("adv-toggle").addEventListener("click", () => {
+    const panel = $("adv-panel");
+    panel.hidden = !panel.hidden;
+    $("adv-toggle").textContent = panel.hidden ? "詳細設定 ▾" : "詳細設定 ▴";
+  });
+
+  // ---- screens ----
+  // Footer content is driven from here, in one place, so every path into a
+  // screen (initial load, drop, error, reset) leaves it consistent -- it used
+  // to be set ad hoc per transition and the drop screen's own "drop an image
+  // to begin" CTA was still showing, overlapping the step list, while a run
+  // was in progress.
+  function showScreen(name) {
+    for (const s of ["drop", "progress", "results"]) $(`screen-${s}`).hidden = s !== name;
+    if (name === "progress") {
+      $("footer-hint").textContent = "";
+      $("footer-cta").textContent = "";
+      $("footer-cta").onclick = null;
+    } else if (name === "results") {
+      $("footer-hint").textContent = "";
+      $("footer-cta").textContent = "process another image ↻";
+      $("footer-cta").onclick = resetToDrop;
+    } else {
+      $("footer-hint").textContent = "drag & drop · paste · browse";
+      $("footer-cta").textContent = "drop an image to begin";
+      $("footer-cta").onclick = () => $("file-input").click();
+    }
+  }
+
+  // ---- input: click / drag&drop / paste ----
+  $("file-input").addEventListener("change", (e) => {
+    if (e.target.files[0]) handleFile(e.target.files[0]);
+  });
+
+  let dragDepth = 0;
+  window.addEventListener("dragenter", (e) => {
+    if ($("screen-drop").hidden) return;
+    e.preventDefault(); dragDepth++;
+    $("drag-overlay").hidden = false;
+  });
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("dragleave", () => { dragDepth = Math.max(0, dragDepth - 1); if (dragDepth === 0) $("drag-overlay").hidden = true; });
+  window.addEventListener("drop", (e) => {
+    e.preventDefault(); dragDepth = 0; $("drag-overlay").hidden = true;
+    if ($("screen-drop").hidden) return;
+    const f = e.dataTransfer.files[0];
+    if (f) handleFile(f);
+  });
+  window.addEventListener("paste", (e) => {
+    if ($("screen-drop").hidden) return;
+    for (const item of e.clipboardData.items || []) {
+      if (item.type.startsWith("image/")) { handleFile(item.getAsFile()); break; }
+    }
+  });
+
+  function handleFile(file) {
+    currentFile = file;
+    if (!getApiKey()) { pendingAfterKey = file; showModal(); return; }
+    startRun(file);
+  }
+
+  // ---- run ----
+  function paramsPayload() {
+    return {
+      bg_remove: $("opt-bg-remove").checked,
+      key_color: $("opt-key-color").value,
+      edge_method: $("opt-edge-method").value,
+      band_authority: $("opt-band-authority").checked,
+      crop_on: $("opt-crop-on").checked,
+      use_lineart_ref: $("opt-lineart-ref").checked,
+    };
+  }
+
+  function stepRowHtml(name, state) {
+    const label = STEP_LABELS[name];
+    const idx = String(STEP_ORDER.indexOf(name) + 1).padStart(2, "0");
+    if (state === "running") {
+      return `<div class="steprow current"><div class="step-current"><div class="stepidx">${idx}</div><div class="steplabel">${label} — 実行中</div></div></div>`;
+    }
+    const cls = state === "done" ? "step-done" : "step-pending";
+    const mark = state === "done"
+      ? '<svg width="15" height="15" viewBox="0 0 15 15"><path d="M8.5 1v13M1 8.5h13" stroke="rgba(20,21,26,.4)" stroke-width="1.6"/></svg>'
+      : "";
+    return `<div class="steprow ${cls}"><div style="display:flex;align-items:center;gap:22px;"><div class="stepidx">${idx}</div><div class="steplabel">${label}</div></div>${mark}</div>`;
+  }
+
+  function activeSteps(bgRemove) {
+    return bgRemove ? STEP_ORDER : STEP_ORDER.filter((n) => !["keygen", "mask", "fringe"].includes(n));
+  }
+
+  function renderSteps(steps, activeStates) {
+    $("step-list").innerHTML = steps.map((n) => stepRowHtml(n, activeStates[n] || "pending")).join("");
+  }
+
+  async function startRun(file) {
+    sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+    results = {};
+    showScreen("progress");
+    $("headline").textContent = "processing your image";
+    $("headline-meta").textContent = `${file.name} · ${new Date().toLocaleTimeString("ja-JP")}`;
+    $("error-banner").hidden = true;
+    $("error-actions").hidden = true;
+    $("progress-meta").textContent = "";
+    const steps = activeSteps($("opt-bg-remove").checked);
+    const activeStates = {};
+    renderSteps(steps, activeStates);
+
+    const fd = new FormData();
+    fd.append("image", file);
+    fd.append("session_id", sessionId);
+    fd.append("api_key", getApiKey());
+    fd.append("prompt", promptInput.value);
+    fd.append("params", JSON.stringify(paramsPayload()));
+
+    const t0 = performance.now();
+    let resp;
+    try {
+      resp = await fetch("/api/run", { method: "POST", body: fd });
+    } catch (e) {
+      showError("サーバーに接続できませんでした: " + e.message);
+      return;
+    }
+    if (!resp.ok || !resp.body) { showError("サーバーエラー: " + resp.status); return; }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let stepCount = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        const evMatch = block.match(/^event: (.+)$/m);
+        const dataMatch = block.match(/^data: (.+)$/m);
+        if (!evMatch || !dataMatch) continue;
+        const event = evMatch[1];
+        const data = JSON.parse(dataMatch[1]);
+
+        if (event === "status") {
+          activeStates[data.step] = data.state;
+          renderSteps(steps, activeStates);
+          if (data.state === "done") {
+            stepCount++;
+            results[data.step] = data;
+            $("progress-meta").textContent =
+              `step ${stepCount} / ${steps.length} · elapsed ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+          }
+        } else if (event === "done") {
+          showResults();
+        } else if (event === "error") {
+          showError(data.message);
+        }
+      }
+    }
+  }
+
+  function showError(message) {
+    $("error-banner").hidden = false;
+    $("error-banner").textContent = "エラー: " + message;
+    $("error-actions").hidden = false;
+  }
+  $("error-retry").addEventListener("click", () => { if (currentFile) startRun(currentFile); });
+  $("error-back").addEventListener("click", resetToDrop);
+
+  function fileRow(name, spec, url) {
+    return `<div class="filerow"><div><div class="filename">${name}</div><div class="filespec">${spec}</div></div>` +
+      (url ? `<a class="dl" href="${url}" download>download</a>` : "") + `</div>`;
+  }
+
+  function showResults() {
+    showScreen("results");
+    $("headline").textContent = "AI colorize & cutout studio";
+    $("headline-meta").textContent = `${currentFile ? currentFile.name : ""} · done`;
+    resetZoom();
+
+    const fringe = results.fringe || {};
+    const psd = results.psd || {};
+    const lineart = results.preprocess || {};
+    const mask = results.mask || {};
+
+    previewSources = {
+      before: lineart.square_url || null,
+      lineart: lineart.lineart_url || null,
+      cutout: fringe.cutout_url || null,
+    };
+    const firstAvailable = ["cutout", "before", "lineart"].find((k) => previewSources[k]) || "before";
+    setActivePreviewTab(firstAvailable, { animate: false });
+
+    const list = $("file-list");
+    let html = "";
+    if (fringe.cutout_url) html += fileRow("cutout.png", "transparent · 2048×2048", fringe.cutout_url);
+    if (psd.psd_url) html += fileRow("layers.psd", `${(psd.size_mb || 0).toFixed(1)}MB · uncompressed`, psd.psd_url);
+    if (lineart.lineart_svg_url) html += fileRow("lineart.svg", "vector", lineart.lineart_svg_url);
+    if (mask.mask_svg_url) html += fileRow("mask.svg", "vector", mask.mask_svg_url);
+    list.innerHTML = html;
+  }
+
+  // ---- preview: tab switch (block-tile transition) + wheel zoom/pan ----
+  let previewSources = { before: null, lineart: null, cutout: null };
+  let activePreviewKey = "cutout";
+
+  const TILE_COLS = 10, TILE_ROWS = 7;
+  const tileOverlay = $("tile-overlay");
+  for (let i = 0; i < TILE_COLS * TILE_ROWS; i++) {
+    const t = document.createElement("div");
+    t.className = "tile hide";
+    tileOverlay.appendChild(t);
+  }
+  const tiles = [...tileOverlay.children];
+
+  function setActivePreviewTab(key, { animate = true } = {}) {
+    if (!previewSources[key]) return;
+    activePreviewKey = key;
+    for (const tab of document.querySelectorAll(".preview-tab")) {
+      tab.classList.toggle("active", tab.dataset.key === key);
+      tab.classList.toggle("disabled", !previewSources[tab.dataset.key]);
+    }
+    if (animate) blockSwapImage(previewSources[key]); else $("cutout-img").src = previewSources[key];
+  }
+
+  function blockSwapImage(url) {
+    // cover with tiles, swap the src once fully covered, then reveal in a
+    // shuffled, staggered order -- a small "block dissolve" instead of a
+    // plain crossfade, per the requested "block unit" transition.
+    tiles.forEach((t) => { t.style.transitionDelay = "0ms"; t.classList.remove("hide"); });
+    setTimeout(() => {
+      $("cutout-img").src = url;
+      const order = tiles.map((_, i) => i).sort(() => Math.random() - 0.5);
+      order.forEach((idx, seq) => {
+        tiles[idx].style.transitionDelay = (seq * 10) + "ms";
+        tiles[idx].classList.add("hide");
+      });
+    }, 260);
+  }
+
+  for (const tab of document.querySelectorAll(".preview-tab")) {
+    tab.addEventListener("click", () => setActivePreviewTab(tab.dataset.key));
+  }
+
+  // zoom (wheel, centred on the cursor) + pan (drag while zoomed)
+  const stage = $("preview-stage");
+  const zoomwrap = $("preview-zoomwrap");
+  let zoom = 1, panX = 0, panY = 0, dragging = false, dragStart = null;
+
+  function applyZoom() {
+    // Keep the image from being panned entirely out of the frame: at scale s the
+    // content overhangs the stage by (s-1)/2 on each side, and that is exactly how
+    // far it may travel.
+    const maxX = stage.clientWidth * (zoom - 1) / 2;
+    const maxY = stage.clientHeight * (zoom - 1) / 2;
+    panX = Math.max(-maxX, Math.min(maxX, panX));
+    panY = Math.max(-maxY, Math.min(maxY, panY));
+
+    zoomwrap.style.transformOrigin = "center center";
+    zoomwrap.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    stage.classList.toggle("zoomed", zoom > 1);
+
+    const pct = Math.round(zoom * 100);
+    $("zoom-indicator").hidden = zoom <= 1;
+    $("zoom-indicator").textContent = pct + "%";
+    $("zoom-reset").textContent = pct + "%";
+    if (Number($("zoom-range").value) !== pct) $("zoom-range").value = pct;
+  }
+  function resetZoom() { zoom = 1; panX = 0; panY = 0; applyZoom(); }
+
+  $("zoom-range").addEventListener("input", () => {
+    const prev = zoom;
+    zoom = Number($("zoom-range").value) / 100;
+    if (zoom <= 1) { panX = 0; panY = 0; } else { panX *= zoom / prev; panY *= zoom / prev; }
+    applyZoom();
+  });
+  $("zoom-reset").addEventListener("click", resetZoom);
+
+  // ---- preview backdrop (checker / white / dark grey / black) ----
+  const BG_KEYS = ["checker", "white", "gray", "black"];
+  function setPreviewBg(key) {
+    if (!BG_KEYS.includes(key)) key = "checker";
+    for (const k of BG_KEYS) stage.classList.toggle("bg-" + k, k === key);
+    for (const sw of document.querySelectorAll(".bg-swatch")) {
+      sw.classList.toggle("active", sw.dataset.bg === key);
+    }
+    try { localStorage.setItem("preview_bg", key); } catch (e) {}
+  }
+  for (const sw of document.querySelectorAll(".bg-swatch")) {
+    sw.addEventListener("click", () => setPreviewBg(sw.dataset.bg));
+  }
+  try { setPreviewBg(localStorage.getItem("preview_bg") || "checker"); } catch (e) {}
+
+  stage.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const prev = zoom;
+    zoom = Math.min(6, Math.max(1, zoom - e.deltaY * 0.0015 * zoom));
+    if (zoom === 1) { panX = 0; panY = 0; }
+    else {
+      // keep the point under the cursor stationary while the scale changes
+      const rect = stage.getBoundingClientRect();
+      const cx = e.clientX - rect.left - rect.width / 2;
+      const cy = e.clientY - rect.top - rect.height / 2;
+      panX -= cx * (zoom / prev - 1);
+      panY -= cy * (zoom / prev - 1);
+    }
+    applyZoom();
+  }, { passive: false });
+
+  stage.addEventListener("dblclick", resetZoom);
+  stage.addEventListener("mousedown", (e) => {
+    if (zoom <= 1) return;
+    dragging = true; dragStart = { x: e.clientX - panX, y: e.clientY - panY };
+    stage.classList.add("panning");
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    panX = e.clientX - dragStart.x; panY = e.clientY - dragStart.y;
+    applyZoom();
+  });
+  window.addEventListener("mouseup", () => { dragging = false; stage.classList.remove("panning"); });
+
+  function resetToDrop() {
+    showScreen("drop");
+    $("headline").textContent = "AI colorize & cutout studio";
+    $("headline-meta").textContent = "png · svg · psd";
+    $("file-input").value = "";
+    currentFile = null;
+  }
+
+  // ---- fringe live re-tune ----
+  let fringeTimer = null;
+  function scheduleFringe() {
+    clearTimeout(fringeTimer);
+    fringeTimer = setTimeout(async () => {
+      if (!sessionId) return;
+      const fd = new FormData();
+      fd.append("session_id", sessionId);
+      fd.append("choke", $("fr-choke").value);
+      fd.append("feather", $("fr-feather").value);
+      fd.append("gamma", $("fr-gamma").value);
+      const resp = await fetch("/api/fringe", { method: "POST", body: fd });
+      if (resp.ok) {
+        const data = await resp.json();
+        results.fringe = { ...results.fringe, cutout_url: data.cutout_url };
+        previewSources.cutout = data.cutout_url;
+        // a plain swap, not the tab-switch block animation -- this fires on
+        // every slider tick while dragging, and re-running the tile dissolve
+        // each time would fight the drag instead of tracking it.
+        if (activePreviewKey === "cutout") $("cutout-img").src = data.cutout_url;
+      }
+    }, 150);
+  }
+  for (const id of ["fr-choke", "fr-feather", "fr-gamma"]) $(id).addEventListener("input", scheduleFringe);
+})();
+</script>
+</body>
+</html>

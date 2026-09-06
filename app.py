@@ -364,6 +364,8 @@ with gr.Blocks(title="lineart2psd") as demo:
     state_fg_rgb = gr.State(None)
     state_key_rgb = gr.State(None)
 
+    gr.Markdown("[✨ 新しいUIを試す](/)")
+
     with gr.Row():
         with gr.Column():
             in_image = gr.Image(type="filepath", label="入力画像")
@@ -551,4 +553,20 @@ with gr.Blocks(title="lineart2psd") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True, show_error=True)
+    import webbrowser
+
+    import gradio
+    import uvicorn
+
+    from web.server import create_app
+
+    # The new UI at "/" and the REST/SSE API it talks to are a separate FastAPI
+    # app; the classic Gradio UI is mounted onto it unchanged so both are
+    # served from one process/port and can link to each other with a plain
+    # <a href>. See web/pipeline.py's module docstring for why the new UI's
+    # backend does not import do_preprocess/do_generate/etc. from this file.
+    fastapi_app = create_app()
+    fastapi_app = gradio.mount_gradio_app(fastapi_app, demo, path="/gradio")
+
+    webbrowser.open("http://127.0.0.1:7860/")
+    uvicorn.run(fastapi_app, host="127.0.0.1", port=7860)
