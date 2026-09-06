@@ -23,6 +23,12 @@ RESIDUAL_MAX = {"srgb": 50.0, "linear": 0.19}
 # F must come from pixels that are genuinely opaque, not merely "not background".
 # Sweeping this on the benchmark: 90 -> alpha_mae_edge ~30, 120 -> ~14, 140 -> ~11.4,
 # 180 -> ~24. Loose thresholds let key-contaminated pixels seed F and bias alpha.
+# Hue distance at which a pixel is considered unrelated to the key. Measured on a
+# real generated frame: flat background p95 0.019, genuine partial-alpha pixels p1
+# 0.499, certain subject p1 0.694. 0.35 sits 18x above the background side and 2x
+# below the subject side.
+HUE_FULL = 0.35
+
 STRICT_FG_DEFAULT = 140.0
 STRICT_BG_DEFAULT = 8.0
 MIN_SURE_FG_FRACTION = 0.02
@@ -45,15 +51,43 @@ def estimate_key_color(rgb: np.ndarray, preset: str = "green") -> np.ndarray:
     return np.median(rgb[near].astype(np.float32), axis=0)
 
 
+def key_hue_distance(rgb: np.ndarray, key_rgb: np.ndarray) -> np.ndarray:
+    """Distance in the normalised chromaticity plane -- hue only, luminance removed.
+
+    This is what recognises a *darkened* key colour as still being the key. It is the
+    piece the CbCr distance cannot supply, because CbCr magnitude scales with
+    luminance and therefore reports a dark green as far from a bright green.
+    """
+    f = rgb.astype(np.float32)
+    s = f.sum(axis=-1, keepdims=True) + 1e-6
+    k = np.asarray(key_rgb, np.float32).reshape(3)
+    ck = k / max(float(k.sum()), 1e-6)
+    return np.linalg.norm(f / s - ck, axis=-1)
+
+
 def key_distance(rgb: np.ndarray, key_rgb: np.ndarray) -> np.ndarray:
-    """Distance in the CbCr chroma plane: insensitive to luminance, so a dark line
-    against a saturated key separates cleanly."""
+    """CbCr-plane distance, damped where the pixel's hue is the key's own.
+
+    The CbCr term is insensitive to luminance in the sense that a dark line against a
+    saturated key separates cleanly -- but it is *proportional* to chroma magnitude,
+    so a darkened key colour also sits far from a bright key and reads as foreground.
+    Generated art is full of exactly that: the model renders fine hair as a darkened
+    background rather than as hair, giving pixels like [0,90,0] that are 78 away from
+    a [8,243,3] key in CbCr yet are unmistakably background by hue.
+
+    Damping by hue is free on genuine partial-alpha pixels (measured p1 hue 0.499,
+    weight already 1.0) and collapses the distance for those impostors, which fixes
+    every downstream consumer at once: the fallback alpha, the trimap, the seeds, and
+    the per-tile sure-foreground test in maskgen.
+    """
     ycc = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb).astype(np.float32)
     k = cv2.cvtColor(
         np.clip(key_rgb, 0, 255).astype(np.uint8).reshape(1, 1, 3), cv2.COLOR_RGB2YCrCb
     ).astype(np.float32).reshape(3)
     d = ycc[..., 1:] - k[1:]
-    return np.sqrt(np.einsum("...i,...i->...", d, d))
+    dist = np.sqrt(np.einsum("...i,...i->...", d, d))
+    w = np.clip(key_hue_distance(rgb, key_rgb) / HUE_FULL, 0.0, 1.0)
+    return dist * w
 
 
 def distance_alpha(dist: np.ndarray, tol: float, soft: float) -> np.ndarray:
@@ -94,11 +128,17 @@ def native_seeds(rgb: np.ndarray, key_rgb: np.ndarray,
     if dist is None:
         dist = key_distance(rgb, key_rgb)
     sure_bg = dist <= strict_bg
+    # Key-hued pixels are barred from seeding F outright. key_distance already damps
+    # them, but the bar has to be absolute: an F taken from a key-coloured pixel makes
+    # the projection self-consistent (C == F gives a_raw = 1 with zero residual), so
+    # the reconstruction guard cannot catch it. This is the single mechanism behind
+    # the opaque key-coloured rim seen on real generated art.
+    not_key = key_hue_distance(rgb, key_rgb) >= HUE_FULL
     thr = strict_fg
-    sure_fg = dist >= thr
+    sure_fg = (dist >= thr) & not_key
     while sure_fg.mean() < MIN_SURE_FG_FRACTION and thr > 20.0:
         thr *= 0.8
-        sure_fg = dist >= thr
+        sure_fg = (dist >= thr) & not_key
     return sure_bg, sure_fg, thr
 
 
@@ -161,12 +201,16 @@ def nearest_color_lut(rgb: np.ndarray, sure_mask: np.ndarray):
 def matte_known_bg(rgb, key_rgb, F, has_F, dist_alpha, space="srgb"):
     """Known-background matting: solve C = a*F + (1-a)*K for a.
 
+    `key_rgb` may be one colour or an (H,W,3) map, which is what lets the same
+    solver run against an image's own locally-estimated background.
+
     -> (alpha float32, stats dict). The guards are evaluated on the *unclamped*
     a_raw; clipping first would bury a failed estimate as solid foreground or
     solid background instead of surfacing it.
     """
     C = colorspace.to_working(rgb, space)
-    K = colorspace.to_working(np.clip(key_rgb, 0, 255).astype(np.uint8).reshape(1, 1, 3), space)
+    k_arr = np.clip(np.asarray(key_rgb, np.float32), 0, 255).astype(np.uint8)
+    K = colorspace.to_working(k_arr.reshape(1, 1, 3) if k_arr.ndim == 1 else k_arr, space)
     Fw = colorspace.to_working(F, space)
     if space == "srgb":
         C, K, Fw = C * 255.0, K * 255.0, Fw * 255.0
@@ -204,7 +248,12 @@ def matte_known_bg(rgb, key_rgb, F, has_F, dist_alpha, space="srgb"):
 
 def decontaminate(rgb, alpha, key_rgb, strength=1.0, space="srgb", band=(0.03, 0.98)):
     """Recover the true foreground colour at partial-alpha pixels by undoing the
-    known composite. This is what removes the key-coloured halo.
+    known composite. This is what removes the background-coloured halo.
+
+    `key_rgb` may be a single colour or an (H,W,3) map of per-pixel background
+    colours, which is what lets the same routine clean an edge against a background
+    that is merely flat *locally* -- the original artwork behind the subject, say,
+    rather than a synthetic key.
 
     Only the boundary band is touched: below `band[0]` the division explodes for no
     visible gain, above `band[1]` the pixel is opaque and must not be altered.
@@ -216,9 +265,12 @@ def decontaminate(rgb, alpha, key_rgb, strength=1.0, space="srgb", band=(0.03, 0
         return rgb.copy()
 
     C = colorspace.to_working(rgb, space)
-    K = colorspace.to_working(
-        np.clip(key_rgb, 0, 255).astype(np.uint8).reshape(1, 1, 3), space
-    ).reshape(3)
+    k_arr = np.clip(np.asarray(key_rgb, np.float32), 0, 255).astype(np.uint8)
+    if k_arr.ndim == 1:
+        k_arr = k_arr.reshape(1, 1, 3)
+    K = colorspace.to_working(k_arr, space)
+    if K.shape[:2] == (1, 1):
+        K = K.reshape(3)
 
     a3 = a[..., None]
     F = np.clip((C - (1.0 - a3) * K) / np.maximum(a3, lo), 0.0, 1.0)

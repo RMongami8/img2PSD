@@ -13,14 +13,20 @@ def adjust(alpha_u8, choke=0.0, feather=0.0, gamma=1.0):
     """
     a = alpha_u8
     if abs(choke) > 1e-6:
-        binary = np.where(a > 127, 255, 0).astype(np.uint8)
-        d_in = cv2.distanceTransform(binary, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        d_out = cv2.distanceTransform(255 - binary, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        sdf = d_out - d_in
-        del d_in, d_out
-        cov = np.clip(0.5 - (sdf - float(choke)), 0.0, 1.0)
-        del sdf
-        a = (cov * 255.0 + 0.5).astype(np.uint8)
+        # Fractional grayscale morphology preserves soft coverage and avoids the
+        # discontinuity caused by thresholding the entire matte at alpha 0.5.
+        # Keep the existing sign convention: positive expands, negative shrinks.
+        amount = abs(float(choke))
+        lo = int(np.floor(amount))
+        frac = amount - lo
+        op = cv2.dilate if choke > 0 else cv2.erode
+        def shifted(radius):
+            if radius == 0:
+                return alpha_u8.astype(np.float32)
+            kernel = np.ones((2 * radius + 1, 2 * radius + 1), np.uint8)
+            return op(alpha_u8, kernel).astype(np.float32)
+        a = np.clip((1.0 - frac) * shifted(lo) + frac * shifted(lo + 1)
+                    + 0.5, 0, 255).astype(np.uint8)
 
     if feather > 1e-6:
         k = int(max(1, round(feather * 3.0)) * 2 + 1)

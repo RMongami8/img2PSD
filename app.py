@@ -16,6 +16,10 @@ def _ts() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def _warn(text: str) -> str:
+    return "\n\n　※ " + text
+
+
 def _append_log(log_text: str, line: str) -> str:
     return (log_text + "\n\n" + line).strip() if log_text else line
 
@@ -88,8 +92,7 @@ def do_preprocess(image_path, radius, bias, min_area, smooth, scale_choice, pad_
     return square, rgba, svg_path, square, ink_hi, alpha, new_log, box
 
 
-def do_generate(square_rgb, alpha, api_key, prompt, use_lineart_ref, log_text,
-                key_bg_on=False, key_color="green"):
+def do_generate(square_rgb, alpha, api_key, prompt, use_lineart_ref, log_text):
     if square_rgb is None:
         raise gr.Error("先に「① 前処理+線画抽出」を実行してください")
     if not api_key:
@@ -98,8 +101,6 @@ def do_generate(square_rgb, alpha, api_key, prompt, use_lineart_ref, log_text,
         raise gr.Error("プロンプトを入力してください")
 
     t0 = time.time()
-    if key_bg_on:
-        prompt = gemini.compose_prompt(prompt, key_color)
     lineart_ref = None
     if use_lineart_ref and alpha is not None:
         h, w = alpha.shape
@@ -122,11 +123,57 @@ def do_generate(square_rgb, alpha, api_key, prompt, use_lineart_ref, log_text,
     return gen_rgb, gen_rgb, new_log
 
 
-def do_mask(gen_rgb, key_color, sr_backend, sr_scale, sr_tile, tol, soft,
+def do_keygen(square_rgb, api_key, key_color, log_text):
+    """Generate the key-background version of the padded original.
+
+    Its only job is to say where the background is. The colours of the cutout come
+    from the original, so nothing the model does to the subject here can reach the
+    output -- which is exactly why this is a separate request from the colourisation.
+    """
+    if square_rgb is None:
+        raise gr.Error("先に「① 前処理+線画抽出」を実行してください")
+    if not api_key:
+        raise gr.Error("Gemini API キーを入力してください")
+
+    t0 = time.time()
+    key_img = gemini.generate_image(api_key, gemini.key_only_prompt(key_color), square_rgb)
+    if key_img.shape[:2] != square_rgb.shape[:2]:
+        key_img = imageops.to_square(key_img, square_rgb.shape[0], "auto")
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    cv2.imwrite(os.path.join(OUT_DIR, f"{_ts()}_keybg.png"),
+                cv2.cvtColor(key_img, cv2.COLOR_RGB2BGR))
+
+    line = f"④-a キー背景版を生成 完了 ({time.time() - t0:.1f}s) key={key_color}"
+    return key_img, key_img, _append_log(log_text, line)
+
+
+def _align_shift(a_rgb, b_rgb, ds=256, rad=4):
+    """Coarse registration between two images, in pixels of the originals.
+
+    The mask is derived from one Gemini pass and applied to a different image, so the
+    one assumption worth checking at runtime is that the two still line up. Reported,
+    never corrected: a silent shift would be worse than a warning.
+    """
+    def edges(x):
+        g = cv2.resize(cv2.cvtColor(x, cv2.COLOR_RGB2GRAY), (ds, ds),
+                       interpolation=cv2.INTER_AREA)
+        return np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 1, ksize=3))
+    A, B = edges(a_rgb), edges(b_rgb)
+    err, dy, dx = min((float(np.abs(A - np.roll(np.roll(B, y, 0), x, 1)).mean()), y, x)
+                      for y in range(-rad, rad + 1) for x in range(-rad, rad + 1))
+    k = a_rgb.shape[0] / float(ds)
+    return int(round(dy * k)), int(round(dx * k))
+
+
+def do_mask(key_img, base_rgb, key_color, sr_backend, sr_scale, sr_tile, tol, soft,
             strict_bg, strict_fg, noise_area, raster_from, mask_smooth,
-            matte_space, decontam, despill_amt, log_text):
-    if gen_rgb is None:
-        raise gr.Error("先に「② Gemini で生成」を実行してください")
+            matte_space, rim_hue, edge_method, trimap_band, decontam, band_mode,
+            log_text):
+    if key_img is None:
+        raise gr.Error("先に「④-a キー背景版を生成」を実行してください")
+    if base_rgb is None:
+        raise gr.Error("先に「① 前処理+線画抽出」を実行してください")
 
     t0 = time.time()
     backend = "lanczos" if str(sr_backend).startswith("Lanczos") else "auto"
@@ -134,27 +181,38 @@ def do_mask(gen_rgb, key_color, sr_backend, sr_scale, sr_tile, tol, soft,
     rf = str(raster_from).split()[0]
 
     r = maskgen.build_matte(
-        gen_rgb, key_preset=key_color, scale=scale, tile=int(sr_tile),
+        key_img, key_preset=key_color, scale=scale, tile=int(sr_tile),
         backend=backend, tol=float(tol), soft=float(soft),
         strict_bg=float(strict_bg), strict_fg=float(strict_fg),
         min_noise_area=int(noise_area), matte_space=matte_space,
-        raster_from=rf, smooth=float(mask_smooth))
+        raster_from=rf, smooth=float(mask_smooth), rim_hue=float(rim_hue))
 
+    # The key image has done its job and is dropped here. Colour comes from the image
+    # actually being cut out, so no key colour can survive into the output; the edge
+    # is cleaned against that image's own local background instead.
     # Colour recovery always uses alpha_source, never the choked matte: undoing the
     # composite with a shrunken alpha over-corrects the edge and whitens dark lines.
-    alpha_src = r["alpha_source"].astype(np.float32) / 255.0
-    fg_rgb = chroma.decontaminate(gen_rgb, alpha_src, r["key_rgb"],
-                                  float(decontam), matte_space)
-    fg_rgb = chroma.despill(fg_rgb, alpha_src, r["key_rgb"], float(despill_amt))
+    method = str(edge_method).split()[0].lower()
+    # key_bg goes along separately from the matte: it is the key image's own
+    # un-eroded verdict, and it is the only thing left that can still speak for a
+    # gap between hair strands too narrow to survive the trimap's erosion.
+    fg_rgb, alpha_src, bst = maskgen.apply_to_base(
+        base_rgb, r["alpha_source"], method, float(decontam), matte_space,
+        trimap_band=int(trimap_band), key_bg=r["key_bg"],
+        band_authority=str(band_mode).startswith("不明帯全体"))
+    # The cut matte inherits the refinement too, so the shape the PSD gets is the one
+    # the preview showed.
+    cut_base = (alpha_src if method == "matting" or str(raster_from).startswith("soft")
+                else np.minimum(r["alpha_cut_base"], alpha_src))
 
-    svg_str = maskgen.to_svg(r["alpha_hi"], gen_rgb.shape[0], r["scale"],
+    svg_str = maskgen.to_svg(r["alpha_hi"], key_img.shape[0], r["scale"],
                              float(mask_smooth))
 
     os.makedirs(OUT_DIR, exist_ok=True)
     ts = _ts()
     mask_path = os.path.join(OUT_DIR, f"{ts}_mask.png")
     svg_path = os.path.join(OUT_DIR, f"{ts}_mask.svg")
-    cv2.imwrite(mask_path, r["alpha_cut_base"])
+    cv2.imwrite(mask_path, cut_base)
     with open(svg_path, "w", encoding="utf-8") as f:
         f.write(svg_str)
 
@@ -167,16 +225,36 @@ def do_mask(gen_rgb, key_color, sr_backend, sr_scale, sr_tile, tol, soft,
         f"range={100 * st['fallback_alpha_range'] / att:.2f}% "
         f"resid={100 * st['fallback_residual'] / att:.2f}% "
         f"nofg={100 * st['fallback_no_foreground'] / att:.2f}% / "
-        f"seed_miss={st['seed_miss']} f_native={st['f_native_used']}"
+        f"seed_miss={st['seed_miss']} f_native={st['f_native_used']} "
+        f"rim_removed={st['rim_removed']}" + "\n\n"
+        f"　境界: {bst['solver']} "
+        + (f"trimap fg/bg/unknown = {100 * bst['fg']:.1f}/{100 * bst['bg']:.1f}/"
+           f"{100 * bst['unknown']:.2f}% ({bst['unknown_px']}px) "
+           f"救済 消えた髪{bst['lost_px']} 白フチ{bst['false_px']}"
+           if "unknown" in bst else f"refined={bst.get('refined', 0)}")
     )
+    for k, label in (("tiles_solved", "タイル"), ("overlap_alpha_max", "重なりα差"),
+                     ("ichol_retries", "ichol再試行"), ("pinned", "背景固定")):
+        if bst.get(k):
+            line += f" {label}={bst[k]}"
+    dy, dx = _align_shift(key_img, base_rgb)
+    if dy or dx:
+        line += _warn(f"キー背景版が元画像に対して {dx:+d},{dy:+d} px ずれています。"
+                      "マスクの位置が合っていない可能性があります。④-a をやり直してください。")
+    # Only the analytic route reports this: it is the only one whose colours come from
+    # unpremultiplying against the estimated background, so it is the only one a
+    # region without such an estimate changes.
+    if bst.get("no_local_bg"):
+        line += _warn(f"元画像の背景が一様でない領域が {bst['no_local_bg']} px あり、"
+                      "そこではエッジ色浄化を行っていません。")
     if st["seed_miss"] > 0:
         line += "\n\n　※ seed_miss>0: 超解像がネイティブ解像度の背景の隙間を埋めています。" \
                 "SR倍率を下げるか Lanczos に切り替えてください。"
 
     # alpha_cut_base is returned twice: once as the cached base the fringe controls
     # act on, once as the live cut so PSD export works even if step 5 is skipped
-    return (r["alpha_cut_base"], svg_path, r["alpha_source"], r["alpha_cut_base"],
-            r["alpha_cut_base"], fg_rgb, r["key_rgb"], _append_log(log_text, line))
+    return (cut_base, svg_path, alpha_src, cut_base,
+            cut_base, fg_rgb, r["key_rgb"], _append_log(log_text, line))
 
 
 def do_fringe(fg_rgb, alpha_cut_base, choke, feather, gamma, log_text):
@@ -204,11 +282,12 @@ def do_psd(square_rgb, alpha, gen_rgb, log_text, box=None, crop_on=True,
     sh, sw = square_rgb.shape[:2]
     cut = np.full((sh, sw), 255, np.uint8) if cut_alpha is None else cut_alpha
 
-    layers = [{"name": "original", "rgb": square_rgb, "alpha": cut}]
+    # fg_rgb is the original with its edge cleaned against its own background, so it
+    # replaces the original layer -- not the generated one, which is a different image.
+    layers = [{"name": "original",
+               "rgb": fg_rgb if fg_rgb is not None else square_rgb, "alpha": cut}]
     if gen_rgb is not None:
-        layers.append({"name": "generated",
-                       "rgb": fg_rgb if fg_rgb is not None else gen_rgb,
-                       "alpha": cut})
+        layers.append({"name": "generated", "rgb": gen_rgb, "alpha": cut})
     lineart_alpha = alpha if cut_alpha is None else (
         (alpha.astype(np.uint16) * cut.astype(np.uint16) // 255).astype(np.uint8))
     layers.append({"name": "lineart", "rgb": np.zeros((sh, sw, 3), np.uint8),
@@ -242,31 +321,33 @@ def do_psd(square_rgb, alpha, gen_rgb, log_text, box=None, crop_on=True,
 
 def do_all(image_path, api_key, prompt, use_lineart_ref, radius, bias, min_area, smooth,
            scale_choice, pad_choice, log_text, line_weight, crop_on,
-           bg_remove, key_color, key_bg_prompt, sr_backend, sr_scale, sr_tile,
+           bg_remove, key_color, sr_backend, sr_scale, sr_tile,
            tol, soft, strict_bg, strict_fg, noise_area, raster_from, mask_smooth,
-           matte_space, decontam, despill_amt, choke, feather, matte_gamma):
+           matte_space, rim_hue, edge_method, trimap_band, decontam, band_mode,
+           choke, feather, matte_gamma):
     square, rgba, svg_path, sq_state, ink_hi_state, alpha_state, log1, box_state = do_preprocess(
         image_path, radius, bias, min_area, smooth, scale_choice, pad_choice, log_text, line_weight)
     gen_disp, gen_state, log2 = do_generate(sq_state, alpha_state, api_key, prompt,
-                                            use_lineart_ref, log1,
-                                            bg_remove and key_bg_prompt, key_color)
+                                            use_lineart_ref, log1)
 
-    mask_disp = cut_disp = mask_svg = None
-    alpha_src = cut_base = cut_alpha = fg_rgb = key_rgb = None
-    log4 = log2
+    key_disp = mask_disp = cut_disp = mask_svg = None
+    key_state = alpha_src = cut_base = cut_alpha = fg_rgb = key_rgb = None
+    log5 = log2
     if bg_remove:
+        key_disp, key_state, log3 = do_keygen(sq_state, api_key, key_color, log2)
         (mask_disp, mask_svg, alpha_src, cut_base, cut_alpha, fg_rgb, key_rgb,
-         log3) = do_mask(gen_state, key_color, sr_backend, sr_scale, sr_tile, tol,
-                         soft, strict_bg, strict_fg, noise_area, raster_from,
-                         mask_smooth, matte_space, decontam, despill_amt, log2)
-        cut_disp, cut_alpha, log4 = do_fringe(fg_rgb, cut_base, choke, feather,
-                                              matte_gamma, log3)
+         log4) = do_mask(key_state, sq_state, key_color, sr_backend, sr_scale, sr_tile,
+                         tol, soft, strict_bg, strict_fg, noise_area, raster_from,
+                         mask_smooth, matte_space, rim_hue, edge_method, trimap_band,
+                         decontam, band_mode, log3)
+        cut_disp, cut_alpha, log5 = do_fringe(fg_rgb, cut_base, choke, feather,
+                                              matte_gamma, log4)
 
-    psd_path, log5 = do_psd(sq_state, alpha_state, gen_state, log4, box_state, crop_on,
+    psd_path, log6 = do_psd(sq_state, alpha_state, gen_state, log5, box_state, crop_on,
                             cut_alpha, fg_rgb)
-    return (square, rgba, svg_path, gen_disp, mask_disp, cut_disp, mask_svg, psd_path,
-            sq_state, ink_hi_state, alpha_state, gen_state, alpha_src, cut_base,
-            cut_alpha, fg_rgb, key_rgb, log5, box_state)
+    return (square, rgba, svg_path, gen_disp, key_disp, mask_disp, cut_disp, mask_svg,
+            psd_path, sq_state, ink_hi_state, alpha_state, gen_state, key_state,
+            alpha_src, cut_base, cut_alpha, fg_rgb, key_rgb, log6, box_state)
 
 
 with gr.Blocks(title="lineart2psd") as demo:
@@ -274,6 +355,7 @@ with gr.Blocks(title="lineart2psd") as demo:
     state_ink_hi = gr.State(None)
     state_alpha = gr.State(None)
     state_gen = gr.State(None)
+    state_key_img = gr.State(None)
     state_log = gr.State("")
     state_box = gr.State(None)
     state_alpha_source = gr.State(None)
@@ -313,8 +395,11 @@ with gr.Blocks(title="lineart2psd") as demo:
                 in_bg_remove = gr.Checkbox(label="背景透過を有効にする", value=True)
                 in_key_color = gr.Dropdown(["green", "magenta", "blue"], value="green",
                                             label="キー色（キャラに使われていない色を選ぶ）")
-                in_key_bg_prompt = gr.Checkbox(
-                    label="Gemini にキー背景を指示する（②の生成に統合）", value=True)
+                gr.Markdown(
+                    "キー背景版は ②とは別に生成します。同じ生成に統合すると、"
+                    "色を取り出す画像そのものにキー色が入ってしまい、"
+                    "モデルが細い髪を「暗いキー色」で描いた縁は原理的に取り切れません。"
+                )
                 in_sr_backend = gr.Dropdown(
                     ["Lanczos (推奨)", "Real-ESRGAN (ONNX/CPU)"], value="Lanczos (推奨)",
                     label="超解像バックエンド")
@@ -330,22 +415,43 @@ with gr.Blocks(title="lineart2psd") as demo:
                 in_noise_area = gr.Slider(0, 500, value=0, step=10,
                                            label="ノイズ除去面積（2048px基準・0推奨）")
                 in_raster_from = gr.Dropdown(
-                    ["binary (シャープ)", "soft (連続)", "path (旧仕様)"],
-                    value="binary (シャープ)", label="マスクの作り方")
+                    ["soft (連続)", "binary (シャープ)", "path (旧仕様)"],
+                    value="soft (連続)", label="マスクの作り方")
+                in_edge_method = gr.Dropdown(
+                    ["matting (α再推定＋前景色推定・推奨)", "foreground (前景色推定のみ)",
+                     "analytic (旧・解析的)"],
+                    value="matting (α再推定＋前景色推定・推奨)", label="境界の処理")
+                in_trimap_band = gr.Slider(1, 12, value=3, step=1,
+                                            label="trimap の不明バンド幅 (px)")
+                in_band_mode = gr.Dropdown(
+                    ["不明帯全体を再推定（隙間が綺麗・推奨）",
+                     "不一致のみ再推定（髪を優先して残す）"],
+                    value="不明帯全体を再推定（隙間が綺麗・推奨）",
+                    label="不明帯の扱い")
+                gr.Markdown(
+                    "実測（実画像）: 元画像の白背景が髪の隙間に残る量は "
+                    "**不明帯全体で 5px、不一致のみで 204px**（α>128）。"
+                    "代わりに全体再推定は細い髪を約900px（図の0.09%）失います。"
+                    "髪が痩せて見える場合だけ「不一致のみ」に切り替えてください。")
+                in_rim_hue = gr.Slider(
+                    0.0, 0.6, value=0.35, step=0.05,
+                    label="キー色リム除去（0で無効・キー色の服がある時は下げる）")
                 in_mask_smooth = gr.Slider(0, 3, value=0.25, step=0.25,
                                             label="SVG 輪郭簡略化")
                 in_matte_space = gr.Dropdown(["srgb", "linear"], value="srgb",
                                               label="マット計算の色空間")
                 gr.Markdown(
-                    "**フリンジ調整**（マスク生成後、スライダーを離すと即反映）")
+                    "**フリンジ調整**（マスク生成後、スライダーを離すと即反映）。"
+                    "形状だけを動かし、前景色は再推定しません。"
+                    "そのため choke を動かしても色は変化しません。")
                 in_choke = gr.Slider(-3.0, 3.0, value=0.0, step=0.1,
                                       label="エッジ収縮/膨張 (px)")
                 in_feather = gr.Slider(0, 5, value=0.0, step=0.1, label="エッジぼかし (px)")
                 in_matte_gamma = gr.Slider(0.2, 3.0, value=1.0, step=0.05,
                                             label="マット濃度 (ガンマ)")
-                in_despill = gr.Slider(0, 1, value=0.0, step=0.05,
-                                        label="スピル除去（通常は0。色浄化で足りない時のみ）")
-                in_decontam = gr.Slider(0, 1, value=1.0, step=0.05, label="エッジ色浄化")
+                in_decontam = gr.Slider(
+                    0, 1, value=1.0, step=0.05,
+                    label="エッジ色浄化（元画像の背景を境界画素から差し引く）")
                 gr.Markdown(
                     "ベンチマーク実測: Lanczos の方が Real-ESRGAN より "
                     "**マット精度が約2倍良く、約7倍速い**（alpha_mae_edge 19.2 vs 36.4）。"
@@ -357,7 +463,8 @@ with gr.Blocks(title="lineart2psd") as demo:
 
             btn_preprocess = gr.Button("① 前処理+線画抽出")
             btn_generate = gr.Button("② Gemini で生成")
-            btn_mask = gr.Button("④ 背景マスク生成")
+            btn_keygen = gr.Button("④-a キー背景版を生成")
+            btn_mask = gr.Button("④-b 背景マスク生成")
             btn_fringe = gr.Button("⑤ フリンジ調整")
             btn_psd = gr.Button("③ PSD 書き出し")
             btn_all = gr.Button("▶ 一括実行")
@@ -367,6 +474,7 @@ with gr.Blocks(title="lineart2psd") as demo:
             out_lineart = gr.Image(label="線画プレビュー(透過)")
             out_svg = gr.File(label="線画SVG")
             out_gen = gr.Image(label="生成画像")
+            out_key = gr.Image(label="キー背景版（マスク元・出力には使いません）")
             out_mask = gr.Image(label="背景マスク(白黒)")
             out_cutout = gr.Image(label="背景透過プレビュー", image_mode="RGBA")
             out_mask_svg = gr.File(label="マスクSVG")
@@ -384,14 +492,21 @@ with gr.Blocks(title="lineart2psd") as demo:
     btn_generate.click(
         fn=do_generate,
         inputs=[state_square, state_alpha, in_api_key, in_prompt, in_use_lineart_ref,
-                state_log, in_key_bg_prompt, in_key_color],
+                state_log],
         outputs=[out_gen, state_gen, state_log],
     ).then(fn=lambda log: log, inputs=state_log, outputs=out_log)
 
-    mask_inputs = [state_gen, in_key_color, in_sr_backend, in_sr_scale, in_sr_tile,
-                   in_key_tol, in_key_soft, in_strict_bg, in_strict_fg, in_noise_area,
-                   in_raster_from, in_mask_smooth, in_matte_space, in_decontam,
-                   in_despill, state_log]
+    btn_keygen.click(
+        fn=do_keygen,
+        inputs=[state_square, in_api_key, in_key_color, state_log],
+        outputs=[out_key, state_key_img, state_log],
+    ).then(fn=lambda log: log, inputs=state_log, outputs=out_log)
+
+    mask_inputs = [state_key_img, state_square, in_key_color, in_sr_backend, in_sr_scale,
+                   in_sr_tile, in_key_tol, in_key_soft, in_strict_bg, in_strict_fg,
+                   in_noise_area, in_raster_from, in_mask_smooth, in_matte_space,
+                   in_rim_hue, in_edge_method, in_trimap_band, in_decontam,
+                   in_band_mode, state_log]
     mask_outputs = [out_mask, out_mask_svg, state_alpha_source, state_cut_base,
                     state_cut_alpha, state_fg_rgb, state_key_rgb, state_log]
     btn_mask.click(
@@ -421,14 +536,15 @@ with gr.Blocks(title="lineart2psd") as demo:
         fn=do_all,
         inputs=[in_image, in_api_key, in_prompt, in_use_lineart_ref, in_radius, in_bias,
                 in_min_area, in_smooth, in_scale, in_pad, state_log, in_line_weight,
-                in_crop_psd, in_bg_remove, in_key_color, in_key_bg_prompt, in_sr_backend,
+                in_crop_psd, in_bg_remove, in_key_color, in_sr_backend,
                 in_sr_scale, in_sr_tile, in_key_tol, in_key_soft, in_strict_bg,
                 in_strict_fg, in_noise_area, in_raster_from, in_mask_smooth,
-                in_matte_space, in_decontam, in_despill, in_choke, in_feather,
+                in_matte_space, in_rim_hue, in_edge_method, in_trimap_band,
+                in_decontam, in_band_mode, in_choke, in_feather,
                 in_matte_gamma],
-        outputs=[out_square, out_lineart, out_svg, out_gen, out_mask, out_cutout,
-                 out_mask_svg, out_psd,
-                 state_square, state_ink_hi, state_alpha, state_gen,
+        outputs=[out_square, out_lineart, out_svg, out_gen, out_key, out_mask,
+                 out_cutout, out_mask_svg, out_psd,
+                 state_square, state_ink_hi, state_alpha, state_gen, state_key_img,
                  state_alpha_source, state_cut_base, state_cut_alpha, state_fg_rgb,
                  state_key_rgb, state_log, state_box],
     ).then(fn=lambda log: log, inputs=state_log, outputs=out_log)

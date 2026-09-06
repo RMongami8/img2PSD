@@ -13,6 +13,12 @@ Modes:
 Usage:
   python tools/eval_matte.py --crops A,B,C,D
   python tools/eval_matte.py --full --modes distance,oracle,nearest
+  python tools/eval_matte.py --two-pass --methods analytic,foreground,matting
+
+--two-pass evaluates what actually ships: the mask comes from the key-background
+image and every colour comes from a different one. white_reference is built from the
+same F and alpha as green_input, so it stands in exactly for the original artwork --
+and unlike real data it comes with ground truth for both alpha and F.
 """
 import argparse
 import ctypes
@@ -26,7 +32,7 @@ import numpy as np
 import cv2
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from core import chroma, maskgen  # noqa: E402
+from core import chroma, maskgen, matting  # noqa: E402
 
 BENCH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "benchmark")
 
@@ -142,7 +148,11 @@ def run_mode(mode, rgb, key_rgb, tol, soft, strict_bg, strict_fg, space, fg_gt=N
 
 
 # ---------------------------------------------------------------- metrics
-def metrics(alpha, fg_rgb, alpha_gt, fg_gt, white_gt, enclosed, stats):
+def metrics(alpha, fg_rgb, alpha_gt, fg_gt, white_gt, enclosed, stats, key_hue=None):
+    """key_hue is the per-pixel hue distance to the key. rim_px counts pixels the
+    matte calls foreground while their hue says they are the key at a different
+    luminance -- the failure mode real generated art has and the benchmark does
+    not, so it reads 0 here and only earns its keep on real inputs."""
     a = alpha.astype(np.float32)
     agt = alpha_gt.astype(np.float32) / 255.0
     edge = (alpha_gt > 0) & (alpha_gt < 255)
@@ -159,6 +169,7 @@ def metrics(alpha, fg_rgb, alpha_gt, fg_gt, white_gt, enclosed, stats):
     solid_fg = alpha_gt == 255
     att = max(stats["attempted"], 1)
     out = {
+        "rim_px": int(((a > 0.5) & (key_hue < 0.12)).sum()) if key_hue is not None else 0,
         "alpha_mae_edge": d_alpha[edge].mean() if n_edge else 0.0,
         "alpha_p95_edge": np.percentile(d_alpha[edge], 95) if n_edge else 0.0,
         "white_mae_edge": d_white[edge].mean() if n_edge else 0.0,
@@ -178,7 +189,62 @@ def metrics(alpha, fg_rgb, alpha_gt, fg_gt, white_gt, enclosed, stats):
 
 HDR = ["alpha_mae_edge", "alpha_p95_edge", "white_mae_edge", "white_p95_edge",
        "premul_rgb_mae_edge", "edge_rgb_mae_a32", "hole_bg_recall", "hole_false_pos",
-       "fb_denom%", "fb_range%", "fb_resid%", "fb_nofg%"]
+       "rim_px", "fb_denom%", "fb_range%", "fb_resid%", "fb_nofg%"]
+
+
+def _shift(img, dx):
+    """Offset the key image against the base by a sub-pixel amount.
+
+    The benchmark's green image is an exact composite of the same F and alpha as
+    white_reference, so at zero shift its matte is ground truth by construction and
+    nothing can improve on it. That is not the situation real inputs are in: two
+    Gemini passes agree only to about a pixel. Shifting restores the failure mode the
+    benchmark is missing, while keeping the ground truth that real data lacks.
+    """
+    m = np.float32([[1, 0, dx], [0, 1, dx * 0.5]])
+    return cv2.warpAffine(img, m, (img.shape[1], img.shape[0]),
+                          flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def two_pass(green, white, fg_gt, alpha_gt, enclosed, key_rgb, methods, band, shift=0.0,
+             band_authority=True):
+    """Mask from the key image, colours from a different image -- with ground truth.
+
+    The foreground estimator is also scored on its own, fed the ground-truth alpha.
+    Without that split an improvement in F and a regression in alpha cancel out and
+    the table says nothing about either.
+    """
+    print("%-12s" % "method" + "".join("%13s" % k for k in HDR) + "%9s%9s" % ("ms", "peakMB"))
+    f_ideal = matting.estimate_foreground(white, alpha_gt.astype(np.float32) / 255.0)
+    edge = (alpha_gt > 0) & (alpha_gt < 255)
+    print("%-12s" % "F|gt-alpha" + " " * (13 * 5)
+          + "%13.3f" % np.abs(f_ideal - fg_gt.astype(np.float32)).mean(-1)[edge].mean()
+          + "   (edge_rgb_mae_a32 column: foreground estimator alone)")
+
+    src = _shift(green, shift) if shift else green
+    for m in methods:
+        t0 = time.time()
+        r = maskgen.build_matte(src, scale=2, tile=128, backend="lanczos")
+        # key_bg and band_authority go through as well, or the benchmark scores a
+        # configuration the app never runs. Note this benchmark cannot see what
+        # band_authority is for: its green image is an exact composite of `white`, so
+        # the redrawn-hair disagreement the real pair has does not exist here, and
+        # the setting reads as pure cost. Judge it on real output, not on this table.
+        fg, a8, st = maskgen.apply_to_base(white, r["alpha_source"], m, trimap_band=band,
+                                           key_bg=r["key_bg"],
+                                           band_authority=band_authority)
+        ms = (time.time() - t0) * 1000.0
+        alpha = a8.astype(np.float32) / 255.0
+        stats = {"attempted": max(int(edge.sum()), 1), "fallback_denom": 0,
+                 "fallback_alpha_range": 0, "fallback_residual": 0,
+                 "fallback_no_foreground": 0}
+        mt = metrics(alpha, fg, alpha_gt, fg_gt, white, enclosed, stats,
+                     chroma.key_hue_distance(green, key_rgb))
+        print("%-12s" % m
+              + "".join(("%13d" % mt[k]) if isinstance(mt[k], (int, np.integer))
+                        else ("%13.3f" % float(mt[k])) for k in HDR)
+              + "%9.0f%9.0f" % (ms, peak_mb())
+              + ("   solver=%s" % st.get("solver", "?")))
 
 
 def main():
@@ -194,6 +260,13 @@ def main():
     p.add_argument("--soft", type=float, default=20.0)
     p.add_argument("--strict-bg", type=float, default=8.0)
     p.add_argument("--strict-fg", type=float, default=140.0)
+    p.add_argument("--two-pass", action="store_true")
+    p.add_argument("--methods", default="analytic,foreground,matting")
+    p.add_argument("--trimap-band", type=int, default=3)
+    p.add_argument("--shift", default="0",
+                   help="comma-separated sub-pixel offsets of the key image vs the base")
+    p.add_argument("--no-band-authority", action="store_true",
+                   help="score the disagreement-only blend instead of the shipped default")
     args = p.parse_args()
 
     meta, green, white, fg_gt, alpha_gt = load_benchmark()
@@ -202,6 +275,19 @@ def main():
     print("benchmark %dx%d  key=%s  space=%s  enclosed_bg=%d px"
           % (green.shape[1], green.shape[0], meta["key_rgb"], args.space,
              int(enclosed_full.sum())))
+
+    if args.two_pass:
+        for name in args.crops.split(","):
+            x0, y0 = CROPS[name.strip()]
+            sl = (slice(y0, y0 + 256), slice(x0, x0 + 256))
+            for sv in [float(v) for v in args.shift.split(",")]:
+                print("\n=== two-pass crop %s (%d,%d) edge=%d  key shift %.1fpx ==="
+                      % (name.strip(), x0, y0,
+                         int(((alpha_gt[sl] > 0) & (alpha_gt[sl] < 255)).sum()), sv))
+                two_pass(green[sl], white[sl], fg_gt[sl], alpha_gt[sl], enclosed_full[sl],
+                         key_rgb, [m.strip() for m in args.methods.split(",")],
+                         args.trimap_band, sv, not args.no_band_authority)
+        return
 
     regions = []
     if args.full:
@@ -226,9 +312,10 @@ def main():
                 args.scale, args.backend, args.tile)
             ms = (time.time() - t0) * 1000.0
             m = metrics(alpha, fg_rgb, alpha_gt[sl], fg_gt[sl], white[sl],
-                        enclosed_full[sl], st)
+                        enclosed_full[sl], st, chroma.key_hue_distance(green[sl], key_rgb))
             print("%-11s" % mode
-                  + "".join(("%13.3f" % m[k]) if isinstance(m[k], float) else ("%13d" % m[k])
+                  + "".join(("%13d" % m[k]) if isinstance(m[k], (int, np.integer))
+                            else ("%13.3f" % float(m[k]))
                             for k in HDR)
                   + "%9.0f%9.0f" % (ms, peak_mb()))
 

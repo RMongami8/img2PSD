@@ -33,15 +33,28 @@ def key_bg_instruction(preset: str) -> str:
 
 
 def compose_prompt(prompt: str, key_preset: str = None) -> str:
-    """Append the key-background instruction to the user's prompt.
-
-    Folding this into the existing colourisation call rather than issuing a second
-    request is what keeps the mask aligned: the matte is derived from the very image
-    it will be applied to, so there is no registration error to correct.
-    """
+    """Append the key-background instruction to an arbitrary prompt."""
     if not key_preset:
         return prompt
     return prompt + key_bg_instruction(key_preset)
+
+
+def key_only_prompt(preset: str) -> str:
+    """Prompt for the mask-source pass: replace the background, change nothing else.
+
+    This is deliberately a separate request from the colourisation pass. Folding the
+    two together saves a call but puts the key colour into the very pixels the output
+    colours are taken from, and a key-coloured edge cannot be fully undone once it is
+    there -- the model draws fine hair as a darkened background rather than as hair,
+    so those pixels hold no foreground colour to recover.
+    """
+    name = KEY_PRESETS.get(preset, KEY_PRESETS["green"])[1]
+    return (
+        f"入力画像の背景だけを、完全に均一な{name}の単色に置き換えてください。"
+        "キャラクター本体は一切変更しないこと。線・色・陰影・輪郭・ポーズ・構図・"
+        "サイズ・位置をすべて入力画像のまま維持し、再解釈も再設計もしないこと。"
+        + key_bg_instruction(preset)
+    )
 
 
 def _rgb_to_png_b64(rgb: np.ndarray) -> str:

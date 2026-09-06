@@ -1,7 +1,20 @@
 import numpy as np
 import cv2
 
-from core import chroma, upscale
+from core import chroma, matting, upscale
+
+# Minimum share of a tile that must be certain foreground before the tile is trusted
+# to source F on its own. Below this it falls back to F_native, which is nearest-
+# neighbour upscaled and therefore blocky, so the bar wants to be low: a handful of
+# genuine pixels propagated by distance transform beats a whole tile of blocks.
+TILE_FG_MIN = 0.02
+
+# Tolerance on "the base image agrees this is background", in RGB L2, used when
+# pinning a gap. It only has to absorb the few-LSB noise of a flat background, so it
+# sits far below the distance to any drawn content -- hair against a light ground
+# measures in the hundreds -- and a strand that moved between the two Gemini passes
+# therefore fails the test instead of being pinned transparent.
+PIN_TOL = 24.0
 
 
 def _resize_alpha(alpha_hi, size_wh):
@@ -13,12 +26,18 @@ def _resize_alpha(alpha_hi, size_wh):
 def build_matte(gen_rgb, key_preset="green", scale=2, tile=256, pad=16,
                 backend="auto", tol=30.0, soft=20.0,
                 strict_bg=chroma.STRICT_BG_DEFAULT, strict_fg=chroma.STRICT_FG_DEFAULT,
-                min_noise_area=0, matte_space="srgb", raster_from="binary",
-                smooth=0.25, model="anime6b", speck_repair_area=0):
+                min_noise_area=0, matte_space="srgb", raster_from="soft",
+                smooth=0.25, model="anime6b", speck_repair_area=0,
+                rim_hue=chroma.HUE_FULL):
     """Key the generated image against its flat background and return two mattes.
 
     alpha_source is the analytic matte and is what colour recovery must use.
     alpha_cut_base is the shape the PSD gets, and is what the fringe controls act on.
+
+    rim_hue removes the opaque key-coloured rim that generated art produces (0 to
+    disable). Colour is the discriminator, not geometry: a genuine partial pixel is a
+    mixture and so sits away from the key's own hue, while the rim is the key hue at
+    a different luminance.
     """
     # Non-square input is supported: the app always feeds a squared canvas, but the
     # module is also driven directly from tools and tests.
@@ -48,7 +67,7 @@ def build_matte(gen_rgb, key_preset="green", scale=2, tile=256, pad=16,
     stats = {"attempted": 0, "fallback_denom": 0, "fallback_alpha_range": 0,
              "fallback_residual": 0, "fallback_no_foreground": 0,
              "seed_miss": 0, "seed_override": 0, "f_native_used": 0, "specks_filled": 0,
-             "backend": "lanczos"}
+             "rim_removed": 0, "backend": "lanczos"}
 
     for t in upscale.iter_tiles(gen_rgb, scale, tile, pad, backend, model):
         stats["backend"] = t.backend
@@ -60,8 +79,12 @@ def build_matte(gen_rgb, key_preset="green", scale=2, tile=256, pad=16,
         da = chroma.distance_alpha(dist, tol, soft)
         _, cand_bg, _ = chroma.make_trimap(dist, tol, soft)
 
-        sure_fg_t = dist >= eff_fg
-        if sure_fg_t.mean() >= chroma.MIN_SURE_FG_FRACTION:
+        hue_t = chroma.key_hue_distance(tile_rgb, key_rgb)
+        # key_distance already damps key-hued pixels, but F sourcing gets an explicit
+        # bar as well: an F lifted from a key-coloured pixel satisfies the projection
+        # exactly (C == F) and so is invisible to the reconstruction guard.
+        sure_fg_t = (dist >= eff_fg) & (hue_t >= chroma.HUE_FULL)
+        if sure_fg_t.mean() >= TILE_FG_MIN:
             F, has_F = chroma.nearest_color_lut(tile_rgb, sure_fg_t)
         elif has_F_native:
             patch = upscale.take_patch(F_native, t.pad_box, t.reflect)
@@ -96,6 +119,11 @@ def build_matte(gen_rgb, key_preset="green", scale=2, tile=256, pad=16,
         stats["seed_override"] += int(np.count_nonzero(overridden))
         alpha_t = np.where(overridden, 0.0, alpha_t)
 
+        if rim_hue > 0.0:
+            rim = (alpha_t > 0.5) & (hue_t < float(rim_hue))
+            alpha_t = np.where(rim, 0.0, alpha_t)
+            stats["rim_removed"] += int(np.count_nonzero(rim[ty:ty + H, lx:lx + W]))
+
         core = alpha_t[ty:ty + H, lx:lx + W]
         alpha_hi[Y:Y + H, X:X + W] = np.clip(core * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
@@ -120,12 +148,254 @@ def build_matte(gen_rgb, key_preset="green", scale=2, tile=256, pad=16,
         "alpha_source": alpha_source,
         "alpha_cut_base": alpha_cut_base,
         "alpha_hi": alpha_hi,
+        # Un-eroded and straight off the key image, which is the point: every matte
+        # downstream of here has already lost the 1px gaps it is meant to protect.
+        "key_bg": sure_bg_n,
         "key_rgb": key_rgb,
         "hi_size": alpha_hi.shape[0],
         "scale": scale,
         "stats": stats,
     }
 
+
+def estimate_local_bg(base_rgb, alpha_source, ds=8, radius=6, min_weight=0.02,
+                      std_max=18.0):
+    """Per-pixel background colour of `base_rgb`, read where the matte says background.
+
+    The key image says *which* pixels are background; this asks what colour those
+    pixels have in the image we are actually cutting out. That is what lets
+    chroma.decontaminate clean an edge against ordinary artwork, whose background is
+    flat only locally, instead of against a synthetic key.
+
+    Estimated on a downscaled copy: a box filter there spans ds * radius pixels of the
+    original for the cost of a small one, and the result is smooth by construction.
+    Where too few background pixels are in reach, or where the ones in reach disagree
+    with each other, the estimate is marked unreliable rather than guessed at.
+    -> (bg_map uint8 (H,W,3), reliable bool (H,W))
+    """
+    h, w = alpha_source.shape[:2]
+    sw, sh = max(2, w // ds), max(2, h // ds)
+    m = (alpha_source == 0).astype(np.float32)
+    x = base_rgb.astype(np.float32)
+
+    ms = cv2.resize(m, (sw, sh), interpolation=cv2.INTER_AREA)
+    c1 = cv2.resize(x * m[..., None], (sw, sh), interpolation=cv2.INTER_AREA)
+    c2 = cv2.resize(x * x * m[..., None], (sw, sh), interpolation=cv2.INTER_AREA)
+
+    k = 2 * int(radius) + 1
+    wt = cv2.boxFilter(ms, -1, (k, k))
+    s1 = cv2.boxFilter(c1, -1, (k, k))
+    s2 = cv2.boxFilter(c2, -1, (k, k))
+
+    safe = np.maximum(wt, 1e-6)[..., None]
+    mean = s1 / safe
+    std = np.sqrt(np.maximum(s2 / safe - mean * mean, 0.0)).max(axis=-1)
+    ok = (wt >= min_weight) & (std <= std_max)
+
+    if m.any():
+        flat = x[m > 0]
+        fallback = np.median(flat[::max(1, len(flat) // 100000)], axis=0)
+    else:
+        fallback = np.full(3, 255.0, np.float32)
+    mean = np.where(ok[..., None], mean, fallback)
+
+    bg = cv2.resize(np.clip(mean, 0, 255), (w, h), interpolation=cv2.INTER_LINEAR)
+    rel = cv2.resize(ok.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+    return bg.astype(np.uint8), rel.astype(bool)
+
+
+def _global_bg(base_rgb, alpha_key, spread_max=18.0, sample=100000):
+    """The base image's single background colour, when it has one.
+
+    estimate_local_bg already computes this median, but it hands it back marked
+    unreliable exactly where a narrow gap needs it: a 3px hole holds too few
+    background pixels for the box filter to reach `min_weight`, so the local route
+    has no opinion there at all. The same colour is therefore offered again here,
+    gated on the background being uniform enough for one colour to describe it.
+    -> (colour float32 (3,), uniform bool)
+    """
+    m = alpha_key == 0
+    if not m.any():
+        return np.full(3, 255.0, np.float32), False
+    flat = base_rgb[m].astype(np.float32)
+    flat = flat[::max(1, len(flat) // sample)]
+    med = np.median(flat, axis=0)
+    spread = float(np.percentile(np.linalg.norm(flat - med, axis=-1), 90))
+    return med.astype(np.float32), bool(spread <= spread_max)
+
+
+def pin_background(base_rgb, alpha_key, key_bg, d, rel, tol=PIN_TOL, keep=1):
+    """Hold the centre of a narrow background gap at certain background.
+
+    Three conditions, and each one is load-bearing:
+
+    `key_bg` is read from the key image directly -- chroma.native_seeds, which is
+    deliberately not eroded -- rather than from the matte derived from it. Over pure
+    key colour the matte still comes back at alpha 10-32, above the `bg_max` of 8
+    that build_trimap calls certain, so by the time the trimap is built the evidence
+    that the gap was ever background has already been thrown away. On the 256px
+    synthetic that is the difference between all three gaps filling and none.
+
+    The base image has to agree, against its own background colour. The two Gemini
+    passes register only to about a pixel, so pinning on the key image alone deletes
+    hair that moved between them; requiring the base to look like background as well
+    means a shifted strand fails the test and is solved normally instead. The local
+    estimate is used where it is reliable and the global one fills in where it is
+    not, which is the case in every gap small enough for this to matter.
+
+    And only the centre is pinned -- one erosion step, never `band`. The rim of a
+    gap is a genuine mixture and has to stay in the unknown band to be solved as
+    one, so a 3px gap keeps its middle pixel and gives both edges to the solver.
+
+    Against ground truth the pin costs 2.4 / 10.3 / 7.5 alpha_mae_edge on crops
+    A / B / C at zero shift -- where the benchmark's key image is an exact composite
+    and its matte cannot be improved on -- and buys 7.4 / 6.3 / 10.3 at one pixel of
+    shift, which is the regime two Gemini passes are actually in. Over the same
+    sweep it takes the key-coloured rim from 9 / 25 / 81 px to 0 / 2 / 0.
+    -> (pin bool (H,W) or None, stats)
+    """
+    if key_bg is None:
+        return None, {}
+    match = rel & (d <= tol)
+    colour, uniform = _global_bg(base_rgb, alpha_key)
+    if uniform:
+        match |= np.linalg.norm(base_rgb.astype(np.float32) - colour, axis=-1) <= tol
+    k = np.ones((2 * int(keep) + 1,) * 2, np.uint8)
+    pin = cv2.erode((np.asarray(key_bg, bool) & match).astype(np.uint8), k).astype(bool)
+    return pin, {"pinned": int(pin.sum()), "pin_uniform_bg": uniform}
+
+
+def refine_with_base(alpha_key, base_rgb, bg_map, rel, space="srgb", sure=250):
+    """Re-solve the boundary coverage on the image actually being cut out.
+
+    The key pass decides *what* is background -- which region, which enclosed holes --
+    and it is the only thing that can, since the original's background is not
+    separable by colour. But it decides sub-pixel coverage on its own geometry, and
+    the two Gemini passes agree only to about a pixel. Measured on a thin hair strand:
+    the key mask gave alpha 0.43 and 0.71 to the pure-white pixels either side of the
+    strand and 0.00 to the dark core between them. Those wrongly-opaque background
+    pixels are the pale outline left along every strand once the green is gone.
+
+    So the same known-background solver runs a second time, on the original against
+    its own local background, seeded from what the key mask calls certain subject.
+    Coverage is then the smaller of the two: the key pass can only ever remove.
+
+    Two details are what make it work, both measured on that strand:
+
+    Seeds come from the whole certain region, not just the part with a known local
+    background -- restricted to the latter the nearest seed to a boundary pixel is
+    often itself, F comes back equal to C, and the projection returns 1.0 with zero
+    residual. That is the same self-consistency trap key-coloured pixels spring in
+    the key pass.
+
+    And the seed region is eroded by one pixel. Without it a boundary pixel still
+    seeds itself (alpha 1.00 where the truth is 0.29); with it F comes from the
+    strand's interior and the answer is 0.29. This is the opposite of the key pass,
+    where erosion measurably hurts -- there the seed set is huge and interior, here
+    it is the boundary itself that must not be trusted.
+
+    The solver's own guards handle the rest: where the subject is barely separable
+    from its background -- white cloth on white paper, ||F-B||^2 below DENOM_MIN --
+    the projection is refused and the key mask stands.
+    -> (alpha uint8, refined_px)
+    """
+    seed = alpha_key >= sure
+    seed = cv2.erode(seed.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    if not seed.any():
+        return alpha_key, 0
+    F, has_F = chroma.nearest_color_lut(base_rgb, seed)
+    ak = alpha_key.astype(np.float32) / 255.0
+    a_base, _ = chroma.matte_known_bg(base_rgb, bg_map, F, has_F, ak, space)
+    out = np.where(rel, np.minimum(ak, a_base), ak)
+    out = np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    # Count only changes worth a log line. Almost every boundary pixel moves by a
+    # level or two, which says nothing; a drop of 8 means the two passes disagreed.
+    return out, int(np.count_nonzero(out.astype(np.int16) < alpha_key.astype(np.int16) - 8))
+
+
+def apply_to_base(base_rgb, alpha_key, method="matting", decontam=1.0, space="srgb",
+                  trimap_band=3, budget_gb=4.0, disagree_radius=4, key_bg=None,
+                  band_authority=True, **kw):
+    """Carry the key-derived mask over to the image being cut out.
+
+    This is the whole point of keeping the two images apart: the mask says where the
+    background is, the original supplies every colour. Nothing the key pass did to
+    the subject can reach the output, so a key-coloured edge is impossible by
+    construction rather than by correction.
+
+    method:
+      analytic    the earlier route -- min(alpha_key, alpha solved on the base) plus
+                  an unpremultiply against the local background. Kept as the baseline
+                  every change is judged against
+      foreground  alpha_key unchanged, colours from multi-level foreground estimation
+      matting     alpha re-solved from a trimap, then foreground estimation
+
+    `key_bg` is the key pass's own un-eroded certain-background mask (build_matte's
+    "key_bg"). It feeds pin_background, and only the `matting` route: that is the one
+    that re-solves alpha, so it is the only one a recovered background seed reaches.
+
+    `band_authority` hands the whole unknown band to the solver instead of only the
+    neighbourhood of measured disagreement. On by default: it is what clears the white
+    background left in the gaps between hair strands (204 -> 5 px at alpha>128 on the
+    real pair). Turn it off to keep the key matte's coverage and lose ~900 px less of
+    thin hair -- see matting.blend_by_disagreement for why the two disagree.
+
+    Only `matting` can put back hair the key pass deleted; the other two can subtract
+    but never add. Measured on the real pair, lost-hair candidates 3113 (analytic) /
+    2875 (foreground) / 1341 (matting), hair-region mean alpha 0.709 / 0.730 / 0.849,
+    white-edge candidates 251 / 897 / 335 -- and on the benchmark, where the key image
+    is an exact composite and its alpha is already right, matting costs only 0.26
+    alpha_mae_edge because it defers to the key matte away from disagreement.
+    -> (fg_rgb uint8, alpha uint8, stats)
+    """
+    bg, rel = estimate_local_bg(base_rgb, alpha_key, **kw)
+    d = np.linalg.norm(base_rgb.astype(np.float32) - bg.astype(np.float32), axis=-1)
+    stats = {}
+
+    if method == "analytic":
+        alpha, stats["refined"] = refine_with_base(alpha_key, base_rgb, bg, rel, space)
+        a = alpha.astype(np.float32) / 255.0
+        if decontam > 0.0:
+            fg = np.where(rel[..., None],
+                          chroma.decontaminate(base_rgb, a, bg, decontam, space),
+                          base_rgb)
+        else:
+            fg = base_rgb.copy()
+        stats["solver"] = "analytic"
+        # Only this route recovers colour by unpremultiplying against the estimated
+        # background, so only here does a region without one change the result. The
+        # other two take their colours from the foreground estimator, which needs no
+        # background map, and reporting it there would be noise.
+        stats["no_local_bg"] = int(np.count_nonzero(
+            ~rel & (alpha_key > 8) & (alpha_key < 250)))
+        return fg, alpha, stats
+
+    # The trimap is built for both remaining routes, even though `foreground` does not
+    # re-solve alpha: interior_weight comes from it, so the colour path is identical
+    # and the comparison isolates the change to alpha.
+    pin, pst = pin_background(base_rgb, alpha_key, key_bg, d, rel)
+    trimap, disagree, tst = matting.build_trimap(alpha_key, d, rel, band=int(trimap_band),
+                                                 pin_bg=pin)
+    stats.update(tst)
+    stats.update(pst)
+    a = alpha_key.astype(np.float32) / 255.0
+
+    if method == "matting":
+        a_cf, info = matting.estimate_alpha(base_rgb, trimap, budget_gb)
+        a = matting.blend_by_disagreement(a, a_cf, disagree, int(disagree_radius),
+                                          trimap=trimap if band_authority else None)
+        stats.update(info)
+        stats["disagree_px"] = int(disagree.sum())
+    else:
+        stats["solver"] = "none (alpha unchanged)"
+
+    # alpha stays float from here into foreground estimation -- on thin hair a small
+    # alpha difference moves the unpremultiplied colour a long way, so there is no 8
+    # bit round trip in between.
+    F = matting.estimate_foreground(base_rgb, a)
+    w = matting.interior_weight(trimap)[..., None]
+    fg = np.clip(w * base_rgb.astype(np.float32) + (1.0 - w) * F + 0.5, 0, 255).astype(np.uint8)
+    return fg, np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8), stats
 
 def _repair_specks(alpha_hi, is_key_native, max_area, key_frac_max=0.02):
     """Close transparent specks that the key colour does not justify. Off by default.
